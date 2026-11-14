@@ -7,6 +7,8 @@
 mod audio;
 mod avb;
 mod config;
+#[cfg(target_os = "macos")]
+mod macos_mac;
 mod net;
 mod routing;
 mod timing;
