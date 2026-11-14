@@ -17,6 +17,8 @@ pub const MAC_GPTP_MSRP: Mac = [0x01, 0x80, 0xC2, 0x00, 0x00, 0x0E];
 pub const MAC_MVRP: Mac = [0x01, 0x80, 0xC2, 0x00, 0x00, 0x21];
 pub const MAC_AVDECC: Mac = [0x91, 0xE0, 0xF0, 0x01, 0x00, 0x00];
 pub const MAC_MAAP: Mac = [0x91, 0xE0, 0xF0, 0x00, 0xFF, 0x00];
+/// Platzhalter, den macOS (wie iOS) statt der echten MAC über getifaddrs/sysctl liefert.
+const MAC_MASKED: Mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00];
 
 #[derive(Clone, Debug)]
 pub struct NetIf {
@@ -27,6 +29,9 @@ pub struct NetIf {
 
 pub fn list_interfaces() -> anyhow::Result<Vec<NetIf>> {
     let os_ifs = netdev::get_interfaces();
+    // macOS maskiert MACs in getifaddrs()/sysctl als 02:00:00:00:00:00 -> IOKit fragen.
+    #[cfg(target_os = "macos")]
+    let iokit_macs = crate::macos_mac::mac_addresses();
     let mut out = Vec::new();
     for d in pcap::Device::list().context("pcap: Geräteliste nicht lesbar (Npcap/libpcap installiert?)")? {
         // Windows: pcap-Name "\Device\NPF_{GUID}", netdev-Name "{GUID}"
@@ -35,7 +40,11 @@ pub fn list_interfaces() -> anyhow::Result<Vec<NetIf>> {
             .and_then(|i| i.friendly_name.clone().or(i.description.clone()))
             .or(d.desc.clone())
             .unwrap_or_else(|| d.name.clone());
-        let mac = os.and_then(|i| i.mac_addr).map(|m| m.octets()).filter(|m| *m != [0; 6]);
+        let mac = os.and_then(|i| i.mac_addr).map(|m| m.octets());
+        #[cfg(target_os = "macos")]
+        let mac = iokit_macs.get(&d.name).copied().or(mac);
+        // Nullen und den macOS-Platzhalter nie als eigene Absenderadresse verwenden
+        let mac = mac.filter(|m| *m != [0; 6] && *m != MAC_MASKED);
         out.push(NetIf { pcap_name: d.name.clone(), label, mac });
     }
     Ok(out)
