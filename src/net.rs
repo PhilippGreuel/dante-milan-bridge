@@ -60,10 +60,29 @@ pub fn resolve_interface(query: &str) -> anyhow::Result<NetIf> {
     Ok(found)
 }
 
-fn open(name: &str, timeout_ms: i32) -> anyhow::Result<(Capture<Active>, bool)> {
+/// Zeitstempelquelle für pcap: "default", "host_hiprec" oder "adapter" (NIC-Hardware,
+/// nur mit passender Karte/Treiber, z.B. Intel i210/i225 + aktuelles Npcap – experimentell).
+fn tstamp(kind: &str) -> Option<pcap::TimestampType> {
+    match kind {
+        "host_hiprec" => Some(pcap::TimestampType::HostHighPrec),
+        "adapter" => Some(pcap::TimestampType::Adapter),
+        "default" => None,
+        // Windows: Npcap-Default basiert auf QueryPerformanceCounter und driftet gegen die
+        // Systemuhr – HOST_HIPREC (KeQuerySystemTimePrecise) bleibt synchron.
+        _ if cfg!(target_os = "windows") => Some(pcap::TimestampType::HostHighPrec),
+        _ => None,
+    }
+}
+
+fn open(name: &str, timeout_ms: i32, ts_kind: &str) -> anyhow::Result<(Capture<Active>, bool)> {
     let mk = || {
-        Capture::from_device(name)
-            .map(|c| c.promisc(true).snaplen(2048).immediate_mode(true).timeout(timeout_ms).buffer_size(4 << 20))
+        Capture::from_device(name).map(|c| {
+            let c = c.promisc(true).snaplen(2048).immediate_mode(true).timeout(timeout_ms).buffer_size(4 << 20);
+            match tstamp(ts_kind) {
+                Some(t) => c.tstamp_type(t),
+                None => c,
+            }
+        })
     };
     // Nanosekunden-Zeitstempel, falls die Plattform sie liefert
     if let Ok(c) = mk()?.precision(pcap::Precision::Nano).open() {
@@ -107,15 +126,20 @@ pub fn ts_ns(nano: bool, h: &pcap::PacketHeader) -> i64 {
     h.ts.tv_sec as i64 * 1_000_000_000 + if nano { sub } else { sub * 1000 }
 }
 
-pub fn open_interface(netif: &NetIf) -> anyhow::Result<(Tx, Rx)> {
-    let (tx, _) = open(&netif.pcap_name, 1000)?;
-    let (mut rx, nano) = open(&netif.pcap_name, 2)?;
+pub fn open_interface(netif: &NetIf, ts_kind: &str) -> anyhow::Result<(Tx, Rx)> {
+    let (tx, _) = open(&netif.pcap_name, 1000, "default")?;
+    let (mut rx, nano) = open(&netif.pcap_name, 2, ts_kind)?;
+    // Eigene gesendete gPTP-Frames werden mitgelesen (Sendezeitstempel für Two-Step),
+    // alle anderen eigenen Frames (v.a. 16000 Audio-Pakete/s) ausgefiltert.
+    let me = fmt_mac(netif.mac.as_ref().unwrap()).to_lowercase();
     rx.filter(
-        "ether proto 0x88f7 or ether proto 0x22f0 or ether proto 0x22ea or ether proto 0x88f5 \
-         or (vlan and ether proto 0x22f0)",
+        &format!(
+            "ether proto 0x88f7 or (not ether src {me} and (ether proto 0x22f0 or ether proto 0x22ea \
+             or ether proto 0x88f5 or (vlan and ether proto 0x22f0)))"
+        ),
         true,
     )?;
-    let _ = rx.direction(pcap::Direction::In);
+    let _ = rx.direction(pcap::Direction::InOut);
     Ok((
         Tx { cap: Mutex::new(tx), mac: netif.mac.unwrap(), sent: AtomicU64::new(0), errors: AtomicU64::new(0) },
         Rx { cap: rx, nano },

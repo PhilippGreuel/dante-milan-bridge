@@ -15,6 +15,9 @@ TAI = 37_000_000_000
 s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
 s.bind((IF, 0))
 s.setsockopt(socket.SOL_SOCKET, 35, 1)  # SO_TIMESTAMPNS
+# eigener Sende-Socket: Linux liefert gesendete Frames nur an *andere* Sockets zurück
+tx_sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
+tx_sock.bind((IF, 0))
 MAC = s.getsockname()[4]
 CLOCK = MAC[:3] + b"\xff\xfe" + MAC[3:]
 GPTP_MC = bytes.fromhex("0180C200000E")
@@ -24,7 +27,7 @@ lock = threading.Lock()
 
 def send(f):
     with lock:
-        s.send(f)
+        tx_sock.send(f)
 
 def gptp_now():
     return time.time_ns() + TAI
@@ -41,6 +44,8 @@ def ptp(msg, length, seq, flags=0, control=5, logi=0, body=b""):
     return GPTP_MC + MAC + b"\x88\xf7" + h + body
 
 stats = collections.Counter()
+resp_pending = {}
+delays = []
 results = {}
 streams = {}          # stream_id -> list of (seq, ts, rx_gptp, first sample)
 talker_adv = {}
@@ -60,7 +65,7 @@ def gm_thread():
             body += struct.pack(">HH", 8, 8) + CLOCK
             send(ptp(0xB, 34 + len(body), seq, 0x0008, 5, 0, body))
             # Pdelay an die Bridge
-            pd["t1"] = time.time_ns(); pd["seq"] = seq
+            pd["seq"] = seq; pd.pop("t1", None)
             send(ptp(0x2, 54, seq, 0, 5, 0, b"\x00" * 20))
         time.sleep(0.125)
 
@@ -89,30 +94,39 @@ def rx_thread():
         for lvl, typ, data in anc:   # Kernel-Empfangszeitstempel
             if lvl == socket.SOL_SOCKET and typ == 35:
                 sec, nsec = struct.unpack("qq", data[:16]); rx = sec * 1_000_000_000 + nsec + TAI
-        if f[6:12] == MAC:
-            continue
         et = struct.unpack(">H", f[12:14])[0]; p = f[14:]
+        if f[6:12] == MAC:
+            # Echo eigener Frames -> präzise Sendezeitstempel (wie Hardware-Timestamping)
+            if et == 0x88F7:
+                m = p[0] & 0xF; seq = struct.unpack(">H", p[30:32])[0]
+                if m == 0x2 and pd.get("seq") == seq:
+                    pd["t1"] = rx - TAI
+                elif m == 0x3 and resp_pending.get(seq):
+                    send(ptp(0xA, 54, seq, 0, 5, 0x7F, ts10(rx - TAI) + resp_pending.pop(seq)))
+            continue
         if et == 0x8100:
             et = struct.unpack(">H", f[16:18])[0]; p = f[18:]
         if et == 0x88F7:
             m = p[0] & 0xF; seq = struct.unpack(">H", p[30:32])[0]
             if m == 0x2:     # Pdelay_Req der Bridge
-                t2 = time.time_ns()
-                send(ptp(0x3, 54, seq, 0x0200, 5, 0x7F, ts10(t2) + p[20:30]))
-                send(ptp(0xA, 54, seq, 0, 5, 0x7F, ts10(time.time_ns()) + p[20:30]))
+                resp_pending[seq] = p[20:30]
+                send(ptp(0x3, 54, seq, 0x0200, 5, 0x7F, ts10(rx - TAI) + p[20:30]))
                 stats["pdelay_req_from_bridge"] += 1
             elif m == 0x3:
-                pd["t2"] = rts10(p[34:44]); pd["t4"] = time.time_ns()
-            elif m == 0xA and "t2" in pd:
+                pd["t2"] = rts10(p[34:44]); pd["t4"] = rx - TAI
+            elif m == 0xA and "t2" in pd and "t1" in pd:
                 t3 = rts10(p[34:44])
                 d = ((pd["t4"] - pd["t1"]) - (t3 - pd["t2"])) / 2
-                stats["pdelay_ok"] += 1; results["link_delay_ns_measured_by_switch"] = round(d)
+                stats["pdelay_ok"] += 1
+                delays.append(d)
         elif et == 0x22F0:
             st = p[0]
             if st == 0xFA and (p[1] & 0xF) == 0:
                 entity["id"] = struct.unpack(">Q", p[4:12])[0]; entity["mac"] = f[6:12]
                 entity["talkers"] = struct.unpack(">H", p[24:26])[0]
                 stats["adp"] += 1
+            elif st == 0xFB and (p[1] & 0xF) == 0 and struct.unpack(">Q", p[4:12])[0] == SIM_EID:
+                sim_entity_answer(f, p)
             elif st == 0xFB and (p[1] & 0xF) in (1, 7):
                 seq, cmd = struct.unpack(">HH", p[20:24]); status = p[2] >> 3
                 results.setdefault("aecp", {})[seq] = (cmd & 0x7FFF, status, p[24:])
@@ -140,7 +154,45 @@ def rx_thread():
                 o += 4 + ll
             stats["msrp"] += 1
 
+SIM_EID = int.from_bytes(CLOCK, "big")
+
+def sim_reported_delay():
+    # wie ein Verstärker: gefilterter Wert (Median der letzten 5 Messungen)
+    if not delays:
+        return 0
+    d = sorted(delays[-5:])[len(delays[-5:]) // 2]
+    return max(0, int(d))
+
+def sim_entity_answer(f, p):
+    """Simulierte AVDECC-Entity des Nachbarn (Verstärker)."""
+    cmd = struct.unpack(">H", p[22:24])[0] & 0x7FFF
+    a = p[24:]
+    if cmd == 0x0004:
+        dt, di = struct.unpack(">HH", a[4:8])
+        if dt == 1:
+            d = struct.pack(">HH", 1, 0) + b"Default".ljust(64, b"\0") + struct.pack(">HHH", 0xFFFF, 1, 74) + struct.pack(">HH", 9, 1)
+        elif dt == 9 and di == 0:
+            d = struct.pack(">HH", 9, 0) + b"AVB".ljust(64, b"\0") + struct.pack(">H", 0xFFFF) + MAC + struct.pack(">H", 6) + CLOCK
+            d += bytes([246, 248]) + struct.pack(">H", 0x436A) + bytes([0xFE, 248, 0, 0xFD, 0, 0]) + struct.pack(">H", 1)
+        else:
+            return
+        payload = a[:4] + d
+    elif cmd == 0x0027:
+        payload = a[:4] + CLOCK + struct.pack(">I", sim_reported_delay()) + bytes([0, 7]) + struct.pack(">H", 0)
+        stats["get_avb_info_from_bridge"] += 1
+    else:
+        return
+    r = bytes([0xFB, 0x01]) + struct.pack(">H", 12 + 2 + len(payload)) + p[4:24] + payload
+    send(f[6:12] + MAC + b"\x22\xf0" + r)
+
+def adp_thread():
+    while not stop.is_set():
+        pl = bytes([0xFA, 0x00]) + struct.pack(">H", (10 << 11) | 56) + struct.pack(">QQ", SIM_EID, 0x1234) + b"\x00" * 48
+        send(AVDECC_MC + MAC + b"\x22\xf0" + pl)
+        time.sleep(2)
+
 stop = threading.Event()
+threading.Thread(target=adp_thread, daemon=True).start()
 threading.Thread(target=rx_thread, daemon=True).start()
 threading.Thread(target=gm_thread, daemon=True).start()
 
@@ -213,7 +265,12 @@ while time.time() - t_ready < DUR:
 stop.set(); time.sleep(0.3)
 
 # 4) Streams auswerten
-print(f"\nStats: {dict(stats)}  Link-Delay (vom Switch gemessen): {results.get('link_delay_ns_measured_by_switch')} ns")
+print(f"\nStats: {dict(stats)}")
+if delays:
+    lt = delays[len(delays) // 2:]
+    ok_d = sum(1 for d in lt if d < 800)
+    print("Link-Delay zur Bridge, wie der Nachbar sie misst (ns):", [round(d) for d in delays])
+    print(f"   eingeschwungen: Median {sorted(lt)[len(lt)//2]:.0f} ns, < 800 ns in {ok_d}/{len(lt)} Messungen")
 ok = True
 for sid, pk in streams.items():
     pk = pk[len(pk) // 4:]  # Einschwingphase ignorieren

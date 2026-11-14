@@ -107,7 +107,11 @@ function status() {
   const v = S.avb;
   if (v) {
     rows.push(['AVB-MAC', v.mac], ['Entity-ID', v.entity_id], ['Grandmaster', v.gm_id],
-      ['Link-Delay', v.link_delay_ns == null ? '–' : v.link_delay_ns.toFixed(0) + ' ns'],
+      ['Link-Delay (eigene Messung)', v.link_delay_ns == null ? '–' : v.link_delay_ns.toFixed(0) + ' ns ± ' + v.link_delay_jitter_ns.toFixed(0)],
+      ['Nachbar (Verstärker)', v.neighbor || 'nicht gefunden'],
+      ['Link-Delay laut Nachbar', v.neighbor_reported_ns == null ? '–' : v.neighbor_reported_ns + ' ns ' + (v.neighbor_reported_ns < 800 ? '✓' : '✗ (> 800 ns)')],
+      ['Pdelay-Kompensation', v.turnaround_comp_ns.toFixed(0) + ' ns'],
+      ['TX-Zeitstempel Echo/Fallback', v.tx_echo_hits + ' / ' + v.tx_echo_misses],
       ['GM-Drift', v.rate_ppm == null ? '–' : v.rate_ppm.toFixed(2) + ' ppm'],
       ['SR-VLAN', v.vlan], ['TX Pakete / Fehler', v.tx_packets + ' / ' + v.tx_errors], ['RX Pakete', v.rx_packets]);
     pill('p-ptp', v.gptp_locked ? 'ok' : 'bad', v.gptp_locked ? 'gPTP gelockt' : 'kein gPTP');

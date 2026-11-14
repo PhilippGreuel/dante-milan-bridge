@@ -12,6 +12,7 @@ pub mod avtp;
 pub mod gptp;
 pub mod maap;
 pub mod mrp;
+pub mod neighbor;
 pub mod stack;
 pub mod talker;
 

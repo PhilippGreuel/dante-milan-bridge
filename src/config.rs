@@ -41,6 +41,12 @@ pub struct Config {
     pub tx_delay_us: u32,
     /// Streams auch ohne registrierten Listener senden (nur Test).
     pub always_stream: bool,
+    /// pcap-Zeitstempel: "auto", "default", "host_hiprec", "adapter" (Hardware, experimentell)
+    pub pcap_timestamps: String,
+    /// Kompensation der Software-Zeitstempel im Pdelay-Responder: "auto", "off" oder Wert in ns
+    pub pdelay_compensation: String,
+    /// Link-Delay, die der Nachbar nach Kompensation messen soll (muss < 800 ns sein)
+    pub assumed_link_delay_ns: u32,
 
     // ---- Backend "device" ----
     pub output_device: String,
@@ -72,6 +78,9 @@ impl Default for Config {
             presentation_offset_us: 2000,
             tx_delay_us: 4000,
             always_stream: false,
+            pcap_timestamps: "auto".into(),
+            pdelay_compensation: "auto".into(),
+            assumed_link_delay_ns: 400,
             output_device: String::new(),
             output_channels: 16,
             device_latency_ms: 5.0,

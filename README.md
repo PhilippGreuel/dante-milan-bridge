@@ -55,9 +55,10 @@ Bridge weitergeben, Streams per MSRP reservieren und Traffic per Credit-Based-Sh
   Milan-Listener spielen dann nicht ab.
 * **Geeignet:** Milan-/AVB-Switches, z. B. L-Acoustics LS10, Luminex GigaCore,
   Netgear M4250 AV Line oder Extreme Networks mit AVB-Lizenz.
-* **Direktverbindung:** Bridge-NIC direkt am AVB-Port eines Verstärkers ist protokollseitig
-  möglich (gPTP/MSRP sind Punkt-zu-Punkt). Das Problem der Software-Zeitstempel bleibt
-  aber bestehen: Der Verstärker prüft die Link-Verzögerung ebenfalls.
+* **Daisy-Chain ohne Switch (empfohlen für den Einstieg):** Bridge-NIC direkt an den
+  AVB-Port des ersten Verstärkers, weitere Verstärker dahinter. gPTP und MSRP sind
+  Punkt-zu-Punkt, der integrierte Switch des Verstärkers übernimmt die AVB-Bridge-Funktion.
+  Der Verstärker prüft die Link-Verzögerung zur Bridge. Dafür gibt es die Pdelay-Regelung (s. u.).
 * Das Dante-Netz kann auf den vorhandenen Switches bleiben. Dante braucht kein AVB.
 
 ## Inbetriebnahme
@@ -87,6 +88,9 @@ Wichtige Parameter:
 | `tx_delay_us` | 4000 | Abstand Capture → Versand. Muss größer sein als der DVS-Puffer plus Scheduler-Jitter |
 | `presentation_offset_us` | 2000 | Milan Max-Transit-Time. Erhöhen, falls die Verstärker „late packets“ melden |
 | `always_stream` | false | auch ohne Listener senden (nur zum Testen) |
+| `pdelay_compensation` | `auto` | `auto` (Regelung über Nachbar), `off` oder fester Wert in ns |
+| `assumed_link_delay_ns` | 400 | Zielwert der Regelung (muss < 800 sein) |
+| `pcap_timestamps` | `auto` | `auto`, `default`, `host_hiprec`, `adapter` |
 | `backend` | `milan` | `device` = Ausgabe auf ein OS-Audio-Device (siehe unten) |
 
 Gesamtlatenz Dante → Verstärkerausgang ≈ DVS-Latenz + `tx_delay_us` + `presentation_offset_us`
@@ -95,14 +99,26 @@ Gesamtlatenz Dante → Verstärkerausgang ≈ DVS-Latenz + `tx_delay_us` + `pres
 ## ⚠️ Bekannte Grenzen / Risiken – bitte zuerst lesen
 
 1. **gPTP mit Software-Zeitstempeln.** Weder Npcap noch macOS-BPF liefern Hardware-Zeitstempel
-   für Layer-2-PTP. Der Switch misst deshalb eine zu große Link-Verzögerung zur Bridge
-   (im Test ≈ 30–50 µs statt < 1 µs). Viele AVB-Switches setzen den Port dann auf
-   *asCapable = false* (Schwelle `neighborPropDelayThresh`, Standard 800 ns) und
-   **verweigern die Stream-Reservierung**. Abhilfe:
-   * Switch mit einstellbarer Schwelle verwenden (z. B. Netgear M4250: `dot1as pdelay-threshold`,
-     Extreme, Luminex – bitte im Handbuch prüfen) und diese erhöhen, oder
-   * auf macOS das **Backend `device`** mit dem eingebauten AVB-Stack von macOS verwenden
-     (siehe unten). Dort macht das Betriebssystem gPTP mit Hardware-Zeitstempeln.
+   für Layer-2-PTP. Der Nachbar (Verstärker/Switch) misst deshalb eine zu große
+   Link-Verzögerung zur Bridge und kann den Port als *nicht asCapable* einstufen
+   (Schwelle `neighborPropDelayThresh`, Standard 800 ns). Dann gibt es **keine
+   Stream-Reservierung**. Die Bridge wirkt dem in zwei Stufen entgegen:
+   * **Two-Step mit Sendezeitstempeln:** Eigene Pdelay-Frames werden per pcap zurückgelesen.
+     Im Test sank die Messung des Nachbarn damit von ≈ 40 µs auf ≈ 2 µs.
+   * **Pdelay-Regelung (`pdelay_compensation: "auto"`):** Die Bridge findet den direkten Nachbarn
+     über seine gPTP-Port-Identität und fragt per AVDECC (`GET_AVB_INFO`) ab, welche
+     Link-Delay **er** misst. Die Antwortzeit im Pdelay-Protokoll wird so nachgeführt, dass er
+     `assumed_link_delay_ns` (400 ns) sieht. Im Simulator: Median 1824 → 416 ns.
+     Einzelmessungen streuen aber weiterhin um ±2–3 µs. Ob der Verstärker gefilterte
+     oder einzelne Werte gegen die Schwelle prüft, muss am echten Gerät getestet werden.
+     Die Web-UI zeigt „Link-Delay laut Nachbar“ und die aktuelle Kompensation.
+   * Funktioniert die Regelung nicht (Nachbar ohne AVDECC, z. B. manche Switches):
+     `pdelay_compensation` auf einen festen Wert in ns setzen oder `off`.
+   * Alternativ auf macOS das **Backend `device`** mit dem eingebauten AVB-Stack von macOS
+     (Hardware-Zeitstempel).
+   * Windows: pcap-Zeitstempel werden automatisch auf `host_hiprec` gestellt (synchron zur
+     Systemuhr). Mit Intel i210/i225/i226 und aktuellem Npcap kann `pcap_timestamps: "adapter"`
+     (Hardware-Zeitstempel) ausprobiert werden. Das ist experimentell und ungetestet.
 2. **Echtzeitverhalten.** Der Talker sendet alle 125 µs ein Paket pro Stream und hält
    dafür einen CPU-Kern im Spin-Wait. Energiesparmodi deaktivieren und unter Windows
    den Höchstleistungs-Energieplan nutzen. Der Zähler „verspätet/verworfen“ in der UI zeigt Probleme.
@@ -152,7 +168,8 @@ src/audio.rs         DVS-Eingang, Testton, Device-Backend + Drift-Resampler
 src/routing.rs       lock-freie Routing-Matrix
 src/timing.rs        Zeitbasis, Sample-Clock-DLL
 src/net.rs           pcap/Npcap, Ethernet-Helfer
-src/avb/gptp.rs      802.1AS
+src/avb/gptp.rs      802.1AS, Two-Step-Zeitstempel, Pdelay-Kompensation
+src/avb/neighbor.rs  Regelkreis über AVDECC GET_AVB_INFO des Nachbarn
 src/avb/mrp.rs       MSRP/MVRP
 src/avb/maap.rs      MAAP
 src/avb/avdecc.rs    ADP/AECP/ACMP + Entity-Modell

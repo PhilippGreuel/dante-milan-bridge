@@ -20,6 +20,7 @@ pub struct AvbStack {
     pub gptp: Mutex<Gptp>,
     pub entity: Mutex<Entity>,
     pub maap: Mutex<Maap>,
+    pub neighbor: Mutex<super::neighbor::Neighbor>,
     pub vid: AtomicU16,
     pub always_stream: bool,
     pub running: AtomicBool,
@@ -30,7 +31,7 @@ pub struct AvbStack {
 
 impl AvbStack {
     pub fn start(netif: &NetIf, cfg: &Config) -> anyhow::Result<Arc<Self>> {
-        let (tx, mut rx) = net::open_interface(netif)?;
+        let (tx, mut rx) = net::open_interface(netif, &cfg.pcap_timestamps)?;
         let mac = tx.mac;
         let n = cfg.avb_streams.clamp(1, 8);
         let entity = Entity::new(mac, n, &cfg.entity_name, &cfg.group_name, &cfg.output_names);
@@ -59,9 +60,14 @@ impl AvbStack {
             tx: Arc::new(tx),
             mac,
             streams,
-            gptp: Mutex::new(Gptp::new(net::eui64(&mac))),
+            gptp: Mutex::new({
+                let mut g = Gptp::new(net::eui64(&mac));
+                g.comp = super::gptp::Compensation::parse(&cfg.pdelay_compensation, cfg.assumed_link_delay_ns);
+                g
+            }),
             entity: Mutex::new(entity),
             maap: Mutex::new(Maap::new(n)),
+            neighbor: Mutex::new(Default::default()),
             vid: AtomicU16::new(DEFAULT_SR_VID),
             always_stream: cfg.always_stream,
             running: AtomicBool::new(true),
@@ -78,8 +84,11 @@ impl AvbStack {
                     Ok(pkt) => {
                         let ts = net::ts_ns(nano, pkt.header);
                         s.dispatch(pkt.data, ts);
+                        s.gptp.lock().tick(&s.tx, now_ns());
                     }
-                    Err(pcap::Error::TimeoutExpired) => {}
+                    Err(pcap::Error::TimeoutExpired) => {
+                        s.gptp.lock().tick(&s.tx, now_ns());
+                    }
                     Err(e) => {
                         log::error!("pcap Empfang: {e}");
                         std::thread::sleep(Duration::from_millis(100));
@@ -112,7 +121,14 @@ impl AvbStack {
 
     fn dispatch(&self, frame: &[u8], ts: i64) {
         let Some((_dst, src, et, p)) = net::parse_eth(frame) else { return };
-        if src == self.mac || p.is_empty() {
+        if p.is_empty() {
+            return;
+        }
+        if src == self.mac {
+            // Echo eigener Frames: nur gPTP (Sendezeitstempel)
+            if et == net::ETH_GPTP {
+                self.gptp.lock().on_own_tx(p, ts, &self.tx);
+            }
             return;
         }
         self.rx_packets.fetch_add(1, Ordering::Relaxed);
@@ -120,12 +136,29 @@ impl AvbStack {
             net::ETH_GPTP => self.gptp.lock().on_rx(p, ts, &self.tx),
             net::ETH_AVTP => match p[0] {
                 0xFA => {
+                    {
+                        let mut nb = self.neighbor.lock();
+                        nb.on_adp(&src, p);
+                        nb.on_adp_departing(p);
+                    }
                     let mut e = self.entity.lock();
                     if e.is_discover_for_us(p) {
                         let gm = self.gptp.lock().gm_id;
                         let f = e.adp_available(gm);
                         drop(e);
                         self.tx.send(&f);
+                    }
+                }
+                0xFB if p.len() > 1 && p[1] & 0x0F == 1 => {
+                    let own = self.entity.lock().entity_id;
+                    let port = self.gptp.lock().neighbor_port;
+                    let mut nb = self.neighbor.lock();
+                    let before = nb.reports;
+                    nb.on_response(&self.tx, own, port, p, now_ns());
+                    if nb.reports != before {
+                        let (d, _) = nb.reported.unwrap();
+                        drop(nb);
+                        self.gptp.lock().apply_neighbor_report(d as f64);
                     }
                 }
                 0xFB => {
@@ -233,6 +266,11 @@ impl AvbStack {
                     new_count = 0; // Talker mit "New" neu ankündigen
                     next_decl = 0;
                 }
+            }
+            {
+                let own = self.entity.lock().entity_id;
+                let port = self.gptp.lock().neighbor_port;
+                self.neighbor.lock().tick(&self.tx, own, port, now);
             }
             if now >= next_pdelay {
                 self.gptp.lock().send_pdelay_req(&self.tx);
