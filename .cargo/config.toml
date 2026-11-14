@@ -1,0 +1,5 @@
+[env]
+# Npcap (Windows) und die libpcap von macOS/Linux sind libpcap >= 1.10.
+# Ohne diese Angabe schaltet das pcap-Crate unter Windows u.a. die Wahl der
+# Zeitstempelquelle (tstamp_type) ab.
+LIBPCAP_VER = "1.10.0"
