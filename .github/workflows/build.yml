@@ -1,0 +1,26 @@
+name: build
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Npcap SDK (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://npcap.com/dist/npcap-sdk-1.13.zip -OutFile sdk.zip
+          Expand-Archive sdk.zip -DestinationPath npcap-sdk
+          echo "LIB=$pwd\npcap-sdk\Lib\x64" >> $env:GITHUB_ENV
+      - run: cargo test --release
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dante-milan-bridge-${{ runner.os }}
+          path: |
+            target/release/dante-milan-bridge
+            target/release/dante-milan-bridge.exe

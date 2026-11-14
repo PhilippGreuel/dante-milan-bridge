@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dante-Milan Bridge</title>
+<style>
+  :root { --bg:#14161a; --panel:#1d2026; --line:#2c3038; --text:#e4e6ea; --dim:#8b919c;
+          --accent:#3fa7ff; --ok:#3ecf8e; --warn:#f5b041; --bad:#ef5350; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  header { display:flex; align-items:center; gap:16px; padding:12px 16px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  .pill { padding:2px 8px; border-radius:10px; background:var(--panel); border:1px solid var(--line); color:var(--dim); white-space:nowrap; }
+  .pill.ok { color:var(--ok); border-color:var(--ok); } .pill.warn { color:var(--warn); border-color:var(--warn); } .pill.bad { color:var(--bad); border-color:var(--bad); }
+  main { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:16px; padding:16px; }
+  @media (max-width:900px) { main { grid-template-columns:1fr; } }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:12px; min-width:0; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 10px; font-weight:600; }
+  .toolbar { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+  button { background:#2a2f38; color:var(--text); border:1px solid var(--line); border-radius:4px; padding:5px 10px; cursor:pointer; font:inherit; }
+  button:hover { border-color:var(--accent); } button.primary { background:var(--accent); border-color:var(--accent); color:#04121f; font-weight:600; }
+  .scroll { overflow:auto; max-height:calc(100vh - 170px); }
+  table { border-collapse:separate; border-spacing:0; }
+  th, td { border-right:1px solid var(--line); border-bottom:1px solid var(--line); }
+  th { position:sticky; background:var(--panel); z-index:1; font-weight:500; color:var(--dim); }
+  thead th { top:0; height:110px; vertical-align:bottom; padding:4px 0; }
+  thead th.stream { height:auto; top:0; text-align:center; color:var(--text); padding:4px; border-bottom:1px solid var(--accent); }
+  thead tr.names th { top:25px; }
+  thead th .v { writing-mode:vertical-rl; transform:rotate(180deg); white-space:nowrap; max-height:100px; overflow:hidden; text-overflow:ellipsis; margin:0 auto; cursor:text; }
+  tbody th { left:0; text-align:left; padding:0 8px; white-space:nowrap; max-width:180px; overflow:hidden; text-overflow:ellipsis; cursor:text; z-index:2; }
+  thead th.corner { left:0; z-index:3; }
+  td { width:22px; height:22px; min-width:22px; padding:0; cursor:pointer; }
+  td:hover, td.hl { background:#262b33; }
+  td.on { background:var(--accent); } td.on:hover { background:#6cbcff; }
+  td.sb { border-right:2px solid #445; } th.sb { border-right:2px solid #445; }
+  dl { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; margin:0 0 12px; }
+  dt { color:var(--dim); } dd { margin:0; font-variant-numeric:tabular-nums; word-break:break-all; }
+  .stream-card { border-top:1px solid var(--line); padding:8px 0; }
+  .hint { color:var(--dim); font-size:12px; margin-top:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Dante → AVB/Milan Bridge</h1>
+  <span id="p-audio" class="pill">Audio</span>
+  <span id="p-ptp" class="pill">gPTP</span>
+  <span id="p-maap" class="pill">MAAP</span>
+  <span id="p-streams" class="pill">Streams</span>
+</header>
+<main>
+  <section>
+    <h2>Routing-Matrix</h2>
+    <div class="toolbar">
+      <button id="b-identity">1:1</button>
+      <button id="b-clear">Alle aus</button>
+      <button id="b-save" class="primary">Speichern</button>
+      <span id="msg" class="hint"></span>
+    </div>
+    <div class="scroll"><table id="matrix"></table></div>
+    <div class="hint">Zeilen = Dante-Eingänge, Spalten = AVB-Ausgänge. Klick setzt die Quelle eines Ausgangs, erneuter Klick schaltet stumm. Doppelklick auf einen Namen zum Umbenennen.</div>
+  </section>
+  <section>
+    <h2>Status</h2>
+    <dl id="status"></dl>
+    <h2>AVB-Streams</h2>
+    <div id="streams"></div>
+  </section>
+</main>
+<script>
+let S = null, built = '';
+const $ = id => document.getElementById(id);
+const api = (p, body) => fetch(p, body === undefined ? {} : {method:'POST', body:JSON.stringify(body)}).then(r => r.json());
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function build() {
+  const nIn = S.inputs.length, nOut = S.outputs.length, per = S.backend === 'milan' ? 8 : nOut;
+  let h = '<thead>';
+  if (S.backend === 'milan') {
+    h += '<tr><th class="corner"></th>';
+    for (let s = 0; s < nOut / 8; s++) h += `<th class="stream sb" colspan="8">${esc(S.avb ? S.avb.streams[s].name : 'Stream ' + (s+1))}</th>`;
+    h += '</tr>';
+  }
+  h += '<tr class="names"><th class="corner"></th>';
+  S.outputs.forEach((n, o) => h += `<th class="${(o+1)%per===0?'sb':''}"><div class="v" data-kind="output" data-i="${o}" title="${esc(n)}">${esc(n)}</div></th>`);
+  h += '</tr></thead><tbody>';
+  S.inputs.forEach((n, i) => {
+    h += `<tr><th data-kind="input" data-i="${i}" title="${esc(n)}">${i+1} · ${esc(n)}</th>`;
+    for (let o = 0; o < nOut; o++) h += `<td data-o="${o}" data-i="${i}" class="${(o+1)%per===0?'sb':''}"></td>`;
+    h += '</tr>';
+  });
+  $('matrix').innerHTML = h + '</tbody>';
+}
+
+function paint() {
+  document.querySelectorAll('#matrix td').forEach(td => {
+    td.classList.toggle('on', S.routing[+td.dataset.o] === +td.dataset.i);
+  });
+}
+
+function pill(id, cls, txt) { const e = $(id); e.className = 'pill ' + cls; e.textContent = txt; }
+
+function status() {
+  const a = S.audio, rows = [['Eingang', a.device], ['Kanäle', a.channels], ['Rate (gemessen)', a.rate_est.toFixed(2) + ' Hz'],
+    ['Overflows', a.overflows], ['Underruns', a.underruns]];
+  pill('p-audio', a.callbacks > 0 ? 'ok' : 'bad', a.callbacks > 0 ? 'Audio aktiv' : 'kein Audio');
+  const v = S.avb;
+  if (v) {
+    rows.push(['AVB-MAC', v.mac], ['Entity-ID', v.entity_id], ['Grandmaster', v.gm_id],
+      ['Link-Delay', v.link_delay_ns == null ? '–' : v.link_delay_ns.toFixed(0) + ' ns'],
+      ['GM-Drift', v.rate_ppm == null ? '–' : v.rate_ppm.toFixed(2) + ' ppm'],
+      ['SR-VLAN', v.vlan], ['TX Pakete / Fehler', v.tx_packets + ' / ' + v.tx_errors], ['RX Pakete', v.rx_packets]);
+    pill('p-ptp', v.gptp_locked ? 'ok' : 'bad', v.gptp_locked ? 'gPTP gelockt' : 'kein gPTP');
+    pill('p-maap', v.maap_acquired ? 'ok' : 'warn', v.maap_acquired ? 'MAAP ok' : 'MAAP …');
+    const act = v.streams.filter(s => s.streaming).length;
+    pill('p-streams', act ? 'ok' : 'warn', `${act}/${v.streams.length} Streams aktiv`);
+    $('streams').innerHTML = v.streams.map(s => `<div class="stream-card"><b>${esc(s.name)}</b>
+      <dl><dt>Stream-ID</dt><dd>${s.stream_id}</dd><dt>Ziel</dt><dd>${s.dest}</dd>
+      <dt>Listener</dt><dd>${s.listener}</dd><dt>Sendet</dt><dd>${s.streaming ? 'ja' : 'nein'}</dd>
+      <dt>Pakete</dt><dd>${s.packets}</dd><dt>Verspätet / verworfen</dt><dd>${s.late} / ${s.dropped}</dd></dl></div>`).join('');
+  } else {
+    ['p-ptp','p-maap','p-streams'].forEach(id => $(id).style.display = 'none');
+    $('streams').innerHTML = '<div class="hint">Backend „device“: AVB übernimmt das Betriebssystem.</div>';
+  }
+  $('status').innerHTML = rows.map(([k, x]) => `<dt>${k}</dt><dd>${esc(x)}</dd>`).join('');
+}
+
+async function refresh() {
+  try {
+    S = await api('/api/state');
+    const key = JSON.stringify([S.inputs, S.outputs, S.avb && S.avb.streams.map(s => s.name)]);
+    if (key !== built) { build(); built = key; }
+    paint(); status();
+  } catch (e) { pill('p-audio', 'bad', 'Bridge nicht erreichbar'); }
+}
+
+$('matrix').addEventListener('click', async e => {
+  const td = e.target.closest('td'); if (!td) return;
+  const o = +td.dataset.o, i = +td.dataset.i;
+  const src = S.routing[o] === i ? null : i;
+  S.routing[o] = src; paint();
+  await api('/api/route', {out:o, src});
+});
+$('matrix').addEventListener('mouseover', e => {
+  const td = e.target.closest('td');
+  document.querySelectorAll('td.hl').forEach(x => x.classList.remove('hl'));
+  if (td) document.querySelectorAll(`td[data-o="${td.dataset.o}"], td[data-i="${td.dataset.i}"]`).forEach(x => x.classList.add('hl'));
+});
+$('matrix').addEventListener('dblclick', async e => {
+  const el = e.target.closest('[data-kind]'); if (!el) return;
+  const kind = el.dataset.kind, i = +el.dataset.i;
+  const cur = kind === 'input' ? S.inputs[i] : S.outputs[i];
+  const name = prompt('Neuer Name', cur); if (name == null) return;
+  await api('/api/name', {kind, index:i, name}); built = ''; refresh();
+});
+$('b-identity').onclick = async () => { S.routing = S.outputs.map((_, o) => o < S.inputs.length ? o : null); paint(); await api('/api/routing', S.routing); };
+$('b-clear').onclick = async () => { S.routing = S.outputs.map(() => null); paint(); await api('/api/routing', S.routing); };
+$('b-save').onclick = async () => { const r = await api('/api/save', {}); $('msg').textContent = r.ok ? 'Gespeichert.' : ('Fehler: ' + r.error); setTimeout(() => $('msg').textContent = '', 3000); };
+refresh(); setInterval(refresh, 1000);
+</script>
+</body>
+</html>
